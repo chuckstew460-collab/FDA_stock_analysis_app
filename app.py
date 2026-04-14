@@ -1,4 +1,5 @@
 import math
+import time
 from datetime import date, timedelta
 
 import numpy as np
@@ -49,52 +50,98 @@ def validate_inputs(tickers: list[str], start_date: date, end_date: date):
     return True, ""
 
 
-@st.cache_data(ttl=3600)
-def download_adjusted_close(tickers: list[str], start_date: date, end_date: date):
-    all_tickers = list(dict.fromkeys(tickers + [BENCHMARK]))
+def extract_adj_close(df: pd.DataFrame, ticker: str) -> pd.Series | None:
+    """
+    Robustly extract adjusted close from a yfinance response for a single ticker.
+    """
+    if df is None or df.empty:
+        return None
 
     try:
-        df = yf.download(
-            tickers=all_tickers,
-            start=start_date,
-            end=end_date + timedelta(days=1),
-            auto_adjust=False,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-        )
-    except Exception as e:
-        raise RuntimeError(f"yfinance download failed: {e}")
+        if isinstance(df.columns, pd.MultiIndex):
+            if (ticker, "Adj Close") in df.columns:
+                series = df[(ticker, "Adj Close")].dropna()
+                if len(series) >= 2:
+                    series.name = ticker
+                    return series
+            if ("Adj Close", ticker) in df.columns:
+                series = df[("Adj Close", ticker)].dropna()
+                if len(series) >= 2:
+                    series.name = ticker
+                    return series
+        else:
+            if "Adj Close" in df.columns:
+                series = df["Adj Close"].dropna()
+                if len(series) >= 2:
+                    series.name = ticker
+                    return series
+    except Exception:
+        return None
 
-    if df is None or df.empty:
-        raise RuntimeError("No data was returned by yfinance.")
+    return None
 
-    prices = pd.DataFrame(index=df.index)
 
-    if isinstance(df.columns, pd.MultiIndex):
-        for ticker in all_tickers:
-            try:
-                if (ticker, "Adj Close") in df.columns:
-                    prices[ticker] = df[(ticker, "Adj Close")]
-            except Exception:
-                pass
-    else:
-        if "Adj Close" in df.columns and len(all_tickers) == 1:
-            prices[all_tickers[0]] = df["Adj Close"]
+@st.cache_data(ttl=3600)
+def download_one_ticker(ticker: str, start_date: date, end_date: date, retries: int = 3) -> pd.Series | None:
+    """
+    Download one ticker at a time to reduce Yahoo rate-limit issues on Streamlit Cloud.
+    """
+    for attempt in range(retries):
+        try:
+            df = yf.download(
+                ticker,
+                start=start_date,
+                end=end_date + timedelta(days=1),
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            series = extract_adj_close(df, ticker)
+            if series is not None:
+                return series
+        except Exception:
+            pass
 
+        time.sleep(1.5 + attempt)
+
+    return None
+
+
+@st.cache_data(ttl=3600)
+def download_adjusted_close(tickers: list[str], start_date: date, end_date: date):
+    """
+    Download user tickers + benchmark separately.
+    Returns:
+        prices_raw: DataFrame of adjusted close prices
+        failed: list of tickers that could not be downloaded
+    """
+    all_tickers = list(dict.fromkeys(tickers + [BENCHMARK]))
+
+    series_list = []
     failed = []
+
     for ticker in all_tickers:
-        if ticker not in prices.columns or prices[ticker].dropna().shape[0] < 2:
+        series = download_one_ticker(ticker, start_date, end_date)
+        if series is None:
             failed.append(ticker)
+        else:
+            series_list.append(series)
 
-    keep_cols = [c for c in prices.columns if c not in failed]
-    prices = prices[keep_cols].copy()
+    if not series_list:
+        raise RuntimeError("No price data could be downloaded from Yahoo Finance.")
 
+    prices = pd.concat(series_list, axis=1).sort_index()
     return prices, failed
 
 
 @st.cache_data(ttl=3600)
-def clean_and_align_prices(prices_raw: pd.DataFrame, selected_tickers: list[str]):
+def clean_and_align_prices(prices_raw: pd.DataFrame, selected_tickers: list[str], benchmark_available: bool):
+    """
+    Handle partial data:
+    - Drop user tickers with >5% missing values
+    - Warn user
+    - Align remaining series on overlapping dates
+    """
     warnings_list = []
     dropped = []
 
@@ -102,7 +149,7 @@ def clean_and_align_prices(prices_raw: pd.DataFrame, selected_tickers: list[str]
         return prices_raw, dropped, warnings_list
 
     candidate_cols = [t for t in selected_tickers if t in prices_raw.columns]
-    if BENCHMARK in prices_raw.columns:
+    if benchmark_available and BENCHMARK in prices_raw.columns:
         candidate_cols.append(BENCHMARK)
 
     working = prices_raw[candidate_cols].copy()
@@ -119,7 +166,11 @@ def clean_and_align_prices(prices_raw: pd.DataFrame, selected_tickers: list[str]
         )
 
     keep_user = [t for t in selected_tickers if t in working.columns and t not in dropped]
-    final_cols = keep_user + ([BENCHMARK] if BENCHMARK in working.columns else [])
+
+    final_cols = keep_user.copy()
+    if benchmark_available and BENCHMARK in working.columns:
+        final_cols.append(BENCHMARK)
+
     working = working[final_cols].copy()
 
     if len(keep_user) >= 2:
@@ -151,7 +202,7 @@ def compute_summary_stats(returns: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
-def compute_wealth_index(returns: pd.DataFrame, user_tickers: list[str]):
+def compute_wealth_index(returns: pd.DataFrame, user_tickers: list[str]) -> tuple[pd.DataFrame, pd.Series]:
     wealth = (1 + returns).cumprod() * 10000
     user_returns = returns[user_tickers].copy()
     equal_weight_returns = user_returns.mean(axis=1)
@@ -230,11 +281,20 @@ if failed_user:
         f"The following ticker(s) failed to download or returned insufficient data: {', '.join(failed_user)}"
     )
 
-if BENCHMARK in failed or BENCHMARK not in prices_raw.columns:
-    st.error("The S&P 500 benchmark (^GSPC) could not be downloaded. Please try again later.")
-    st.stop()
+benchmark_available = BENCHMARK in prices_raw.columns and BENCHMARK not in failed
 
-aligned_prices, dropped_tickers, warnings_list = clean_and_align_prices(prices_raw, tickers)
+if not benchmark_available:
+    st.warning(
+        "The S&P 500 benchmark (^GSPC) could not be downloaded right now, likely due to a temporary Yahoo Finance rate limit. "
+        "The rest of the app will still run, and benchmark charts will appear automatically whenever the download succeeds."
+    )
+
+aligned_prices, dropped_tickers, warnings_list = clean_and_align_prices(
+    prices_raw,
+    tickers,
+    benchmark_available=benchmark_available,
+)
+
 active_user_tickers = [t for t in tickers if t in aligned_prices.columns and t != BENCHMARK]
 
 for message in warnings_list:
@@ -248,12 +308,13 @@ if len(active_user_tickers) < 2:
     st.stop()
 
 returns = compute_returns(aligned_prices)
-summary_stats = compute_summary_stats(returns)
-wealth_index, equal_weight_returns = compute_wealth_index(returns, active_user_tickers)
 
 if returns.empty:
     st.error("Not enough return observations after cleaning the data.")
     st.stop()
+
+summary_stats = compute_summary_stats(returns)
+wealth_index, equal_weight_returns = compute_wealth_index(returns, active_user_tickers)
 
 # =========================================================
 # Layout tabs
@@ -268,7 +329,7 @@ tab1, tab2, tab3, tab4 = st.tabs(
 )
 
 # =========================================================
-# Tab 1
+# Tab 1: Price & Return Analysis
 # =========================================================
 with tab1:
     st.header("Price and Return Analysis")
@@ -300,7 +361,7 @@ with tab1:
             legend_title="Ticker",
             height=520,
         )
-        st.plotly_chart(fig_prices, use_container_width=True)
+        st.plotly_chart(fig_prices, width="stretch")
     else:
         st.warning("Select at least one stock to display the price chart.")
 
@@ -315,28 +376,25 @@ with tab1:
             "Max Daily Return",
         ],
     )
-    st.dataframe(stats_display, use_container_width=True)
+    st.dataframe(stats_display, width="stretch")
 
     st.subheader("Cumulative Wealth Index")
     wealth_cols = active_user_tickers.copy()
+    if BENCHMARK in wealth_index.columns:
+        wealth_cols.append(BENCHMARK)
+    if "Equal Weight Portfolio" in wealth_index.columns:
+        wealth_cols.append("Equal Weight Portfolio")
 
-if BENCHMARK in wealth_index.columns:
-    wealth_cols.append(BENCHMARK)
-
-if "Equal Weight Portfolio" in wealth_index.columns:
-    wealth_cols.append("Equal Weight Portfolio")
-
-fig_wealth = go.Figure()
-
-for col in wealth_cols:
-    fig_wealth.add_trace(
-        go.Scatter(
-            x=wealth_index.index,
-            y=wealth_index[col],
-            mode="lines",
-            name=col,
+    fig_wealth = go.Figure()
+    for col in wealth_cols:
+        fig_wealth.add_trace(
+            go.Scatter(
+                x=wealth_index.index,
+                y=wealth_index[col],
+                mode="lines",
+                name=col,
+            )
         )
-    )
 
     fig_wealth.update_layout(
         title="Growth of a $10,000 Investment",
@@ -345,10 +403,10 @@ for col in wealth_cols:
         legend_title="Series",
         height=560,
     )
-    st.plotly_chart(fig_wealth, use_container_width=True)
+    st.plotly_chart(fig_wealth, width="stretch")
 
 # =========================================================
-# Tab 2
+# Tab 2: Risk & Distribution
 # =========================================================
 with tab2:
     st.header("Risk and Distribution Analysis")
@@ -381,7 +439,7 @@ with tab2:
         legend_title="Ticker",
         height=520,
     )
-    st.plotly_chart(fig_rolling_vol, use_container_width=True)
+    st.plotly_chart(fig_rolling_vol, width="stretch")
 
     st.subheader("Distribution Analysis")
     dist_ticker = st.selectbox(
@@ -398,7 +456,6 @@ with tab2:
     )
 
     dist_returns = returns[dist_ticker].dropna()
-
     jb_stat, jb_pvalue = jarque_bera(dist_returns)
 
     col_a, col_b = st.columns(2)
@@ -441,7 +498,7 @@ with tab2:
             yaxis_title="Density",
             height=520,
         )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width="stretch")
 
     else:
         qq_data = probplot(dist_returns, dist="norm")
@@ -476,7 +533,7 @@ with tab2:
             yaxis_title="Sample Quantiles",
             height=520,
         )
-        st.plotly_chart(fig_qq, use_container_width=True)
+        st.plotly_chart(fig_qq, width="stretch")
 
     st.subheader("Box Plot of Daily Return Distributions")
     box_df = returns[active_user_tickers].melt(var_name="Ticker", value_name="Daily Return")
@@ -493,10 +550,10 @@ with tab2:
         showlegend=False,
         height=520,
     )
-    st.plotly_chart(fig_box, use_container_width=True)
+    st.plotly_chart(fig_box, width="stretch")
 
 # =========================================================
-# Tab 3
+# Tab 3: Correlation & Diversification
 # =========================================================
 with tab3:
     st.header("Correlation and Diversification")
@@ -514,7 +571,7 @@ with tab3:
         title="Pairwise Correlation Matrix of Daily Returns",
     )
     fig_heatmap.update_layout(height=520)
-    st.plotly_chart(fig_heatmap, use_container_width=True)
+    st.plotly_chart(fig_heatmap, width="stretch")
 
     st.subheader("Scatter Plot of Two Stocks")
     col1, col2 = st.columns(2)
@@ -536,7 +593,7 @@ with tab3:
         yaxis_title=f"{scatter_y} Daily Return",
         height=520,
     )
-    st.plotly_chart(fig_scatter, use_container_width=True)
+    st.plotly_chart(fig_scatter, width="stretch")
 
     st.subheader("Rolling Correlation")
     col3, col4, col5 = st.columns(3)
@@ -565,7 +622,7 @@ with tab3:
         yaxis_title="Correlation",
         height=520,
     )
-    st.plotly_chart(fig_roll_corr, use_container_width=True)
+    st.plotly_chart(fig_roll_corr, width="stretch")
 
     st.subheader("Two-Asset Portfolio Explorer")
 
@@ -659,7 +716,7 @@ with tab3:
         yaxis_title="Annualized Volatility",
         height=520,
     )
-    st.plotly_chart(fig_port, use_container_width=True)
+    st.plotly_chart(fig_port, width="stretch")
 
     st.info(
         "This curve demonstrates diversification. When the correlation between two stocks is less than 1, "
@@ -668,7 +725,7 @@ with tab3:
     )
 
 # =========================================================
-# Tab 4
+# Tab 4: Data Preview
 # =========================================================
 with tab4:
     st.header("Data Preview")
@@ -676,11 +733,14 @@ with tab4:
     st.subheader("Active User Tickers")
     st.write(", ".join(active_user_tickers))
 
-    st.subheader("Benchmark")
-    st.write(BENCHMARK)
+    st.subheader("Benchmark Status")
+    if benchmark_available:
+        st.write(f"{BENCHMARK} downloaded successfully.")
+    else:
+        st.write(f"{BENCHMARK} unavailable on this run.")
 
     st.subheader("Cleaned Adjusted Close Prices")
-    st.dataframe(aligned_prices.tail(20), use_container_width=True)
+    st.dataframe(aligned_prices.tail(20), width="stretch")
 
     st.subheader("Daily Returns")
-    st.dataframe(returns.tail(20), use_container_width=True)
+    st.dataframe(returns.tail(20), width="stretch")
