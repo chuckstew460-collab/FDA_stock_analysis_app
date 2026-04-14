@@ -1,3 +1,32 @@
+# Virtual environment (managed by uv — don't upload to GitHub)
+.venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# uv project files (Streamlit Cloud uses requirements.txt instead)
+.python-version
+pyproject.toml
+uv.lock
+
+# Environment variables / secrets (uncomment if you add a .env file)
+# .env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+.venv/
+__pycache__/
+*.pyc
+.python-version
+.DS_Store
+Thumbs.db
+.streamlit/
+
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
