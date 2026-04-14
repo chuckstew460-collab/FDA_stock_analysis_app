@@ -230,13 +230,9 @@ if failed_user:
         f"The following ticker(s) failed to download or returned insufficient data: {', '.join(failed_user)}"
     )
 
-benchmark_available = BENCHMARK in prices_raw.columns and BENCHMARK not in failed
-
-if not benchmark_available:
-    st.warning(
-        "The S&P 500 benchmark (^GSPC) could not be downloaded right now due to a Yahoo Finance rate limit. "
-        "The rest of the stock analysis will still run."
-    )
+if BENCHMARK in failed or BENCHMARK not in prices_raw.columns:
+    st.error("The S&P 500 benchmark (^GSPC) could not be downloaded. Please try again later.")
+    st.stop()
 
 aligned_prices, dropped_tickers, warnings_list = clean_and_align_prices(prices_raw, tickers)
 active_user_tickers = [t for t in tickers if t in aligned_prices.columns and t != BENCHMARK]
