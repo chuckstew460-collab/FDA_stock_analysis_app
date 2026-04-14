@@ -318,18 +318,25 @@ with tab1:
     st.dataframe(stats_display, use_container_width=True)
 
     st.subheader("Cumulative Wealth Index")
-    wealth_cols = active_user_tickers + [BENCHMARK, "Equal Weight Portfolio"]
-    fig_wealth = go.Figure()
+    wealth_cols = active_user_tickers.copy()
 
-    for col in wealth_cols:
-        fig_wealth.add_trace(
-            go.Scatter(
-                x=wealth_index.index,
-                y=wealth_index[col],
-                mode="lines",
-                name=col,
-            )
+if BENCHMARK in wealth_index.columns:
+    wealth_cols.append(BENCHMARK)
+
+if "Equal Weight Portfolio" in wealth_index.columns:
+    wealth_cols.append("Equal Weight Portfolio")
+
+fig_wealth = go.Figure()
+
+for col in wealth_cols:
+    fig_wealth.add_trace(
+        go.Scatter(
+            x=wealth_index.index,
+            y=wealth_index[col],
+            mode="lines",
+            name=col,
         )
+    )
 
     fig_wealth.update_layout(
         title="Growth of a $10,000 Investment",
